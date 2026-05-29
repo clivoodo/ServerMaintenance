@@ -1,0 +1,635 @@
+<#
+===============================================================================
+ Script Name : Invoke-VolumeOptimization.ps1
+ Author      : Jason Smith
+ Title       : Senior Network Engineer
+ Company     : Finnegan
+ Created On  : 2026-05-29
+ Last Update : 2026-05-29
+ Version     : 2.0.0
+
+ Purpose     : Automates Windows volume optimization locally or on remote
+               servers using Optimize-Volume and defrag.exe with accurate
+               status reporting, logging, and optional fallback behavior.
+
+ Requirements:
+               - Windows Server 2016 or later
+               - Administrative privileges
+               - Storage module / Optimize-Volume support
+               - WSMan / PowerShell remoting for remote defrag.exe execution
+               - CIM / WinRM connectivity for remote Optimize-Volume actions
+
+ Change Log  :
+   2.0.0 - Added full script header and examples
+         - Added remote server support
+         - Added accurate error handling and unsupported detection
+         - Added optional fallback to Auto
+         - Added pass-through result objects and better logging
+===============================================================================
+
+.SYNOPSIS
+    Automates Windows volume optimization on local or remote Windows servers.
+
+.DESCRIPTION
+    Uses Optimize-Volume for most optimization actions and defrag.exe for
+    FreeSpaceConsolidate (/X). Supports local execution, remote execution by
+    ComputerName, or remote execution using pre-created CimSession objects.
+
+    Modes:
+      - Auto                 : Let Windows choose the correct optimization
+      - Analyze              : Analyze only
+      - Defrag               : Traditional defragmentation
+      - ReTrim               : ReTRIM / UNMAP style optimization
+      - SlabConsolidate      : Slab consolidation where supported
+      - FreeSpaceConsolidate : defrag.exe /X
+
+    Notes:
+      - Optimize-Volume actions are executed locally or through CIM sessions.
+      - FreeSpaceConsolidate uses defrag.exe and runs remotely through
+        PowerShell remoting (Invoke-Command) when targeting remote servers.
+      - Unsupported operations are reported as Unsupported, not Success.
+      - Optional fallback can retry unsupported forced modes as Auto.
+
+.PARAMETER Mode
+    Optimization mode to run.
+    Valid values:
+      Auto, Analyze, Defrag, ReTrim, SlabConsolidate, FreeSpaceConsolidate
+
+.PARAMETER DriveLetters
+    Optional list of drive letters to include, for example:
+      -DriveLetters C,D,E
+
+.PARAMETER ExcludeDriveLetters
+    Optional list of drive letters to exclude, for example:
+      -ExcludeDriveLetters D,E
+
+.PARAMETER IncludeHiddenVolumes
+    Include fixed volumes with no drive letter for Optimize-Volume modes.
+    FreeSpaceConsolidate requires a drive letter.
+
+.PARAMETER NormalPriority
+    Run at normal priority instead of low priority.
+
+.PARAMETER FallbackToAutoOnUnsupported
+    If a forced mode (for example ReTrim) is unsupported on a volume, retry
+    that volume in Auto mode.
+
+.PARAMETER ComputerName
+    One or more remote computers to target.
+    If omitted, the script runs locally unless -CimSession is used.
+
+.PARAMETER Credential
+    Optional credential for remote CIM / remoting operations.
+
+.PARAMETER CimSession
+    One or more existing CIM sessions to use for remote Optimize-Volume work.
+
+.PARAMETER LogPath
+    Path to the log file.
+
+.PARAMETER WhatIfMode
+    Show what would be done without making changes.
+
+.PARAMETER PassThru
+    Return structured result objects to the pipeline.
+
+.EXAMPLE
+    .\Invoke-VolumeOptimization.ps1 -Mode Auto -NormalPriority
+
+    Run locally and let Windows choose the best optimization per volume.
+
+.EXAMPLE
+    .\Invoke-VolumeOptimization.ps1 -Mode ReTrim -DriveLetters C,E,F `
+        -FallbackToAutoOnUnsupported -PassThru
+
+    Run locally, attempt ReTrim, and fall back to Auto when unsupported.
+
+.EXAMPLE
+    .\Invoke-VolumeOptimization.ps1 -ComputerName SRV-FILE01,SRV-FILE02 `
+        -Mode Auto -NormalPriority -PassThru
+
+    Run Optimize-Volume actions on remote servers.
+
+.EXAMPLE
+    $cred = Get-Credential
+    .\Invoke-VolumeOptimization.ps1 -ComputerName SRV-FILE01 `
+        -Credential $cred -Mode ReTrim -FallbackToAutoOnUnsupported
+
+    Run remotely with alternate credentials.
+
+.EXAMPLE
+    $sessions = New-CimSession -ComputerName SRV-FILE01,SRV-FILE02
+    .\Invoke-VolumeOptimization.ps1 -CimSession $sessions -Mode Analyze -PassThru
+
+    Run Analyze against remote servers using pre-created CIM sessions.
+
+.EXAMPLE
+    .\Invoke-VolumeOptimization.ps1 -ComputerName SRV-FILE01 `
+        -Mode FreeSpaceConsolidate -DriveLetters C -NormalPriority
+
+    Run free-space consolidation remotely by invoking defrag.exe /X on the
+    target server through PowerShell remoting.
+
+.NOTES
+    For virtual guests, use caution when forcing traditional Defrag broadly on
+    thin-provisioned, replicated, or snapshot-backed storage.
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Local')]
+param(
+    [ValidateSet('Auto','Analyze','Defrag','ReTrim','SlabConsolidate','FreeSpaceConsolidate')]
+    [string]$Mode = 'Auto',
+
+    [char[]]$DriveLetters,
+
+    [char[]]$ExcludeDriveLetters = @(),
+
+    [switch]$IncludeHiddenVolumes,
+
+    [switch]$NormalPriority,
+
+    [switch]$FallbackToAutoOnUnsupported,
+
+    [Parameter(ParameterSetName = 'ByName')]
+    [string[]]$ComputerName,
+
+    [Parameter(ParameterSetName = 'ByName')]
+    [pscredential]$Credential,
+
+    [Parameter(ParameterSetName = 'ByCim')]
+    [Microsoft.Management.Infrastructure.CimSession[]]$CimSession,
+
+    [string]$LogPath = "C:\Logs\VolumeOptimization_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+
+    [switch]$WhatIfMode,
+
+    [switch]$PassThru
+)
+
+begin {
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+
+    $script:Results = New-Object System.Collections.Generic.List[object]
+    $script:CreatedCimSessions = @()
+
+    $logDir = Split-Path -Path $LogPath -Parent
+    if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    }
+
+    function Write-Log {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Message,
+
+            [ValidateSet('INFO','WARN','ERROR','SUCCESS')]
+            [string]$Level = 'INFO'
+        )
+
+        $line = "[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+        Write-Host $line
+        Add-Content -LiteralPath $LogPath -Value $line
+    }
+
+    function New-ResultObject {
+        param(
+            [string]$ComputerName,
+            [string]$Drive,
+            [string]$Label,
+            [string]$ModeRequested,
+            [string]$ModeExecuted,
+            [string]$Status,
+            [bool]$Success,
+            [string]$Message,
+            [string]$Command,
+            [string]$Output = '',
+            [string]$ErrorId = '',
+            [Nullable[int]]$ExitCode = $null
+        )
+
+        [PSCustomObject]@{
+            Timestamp      = Get-Date
+            ComputerName   = $ComputerName
+            Drive          = $Drive
+            Label          = $Label
+            ModeRequested  = $ModeRequested
+            ModeExecuted   = $ModeExecuted
+            Status         = $Status      # Success | Unsupported | Failed | Skipped | WhatIf
+            Success        = $Success
+            Message        = $Message
+            Command        = $Command
+            ExitCode       = $ExitCode
+            ErrorId        = $ErrorId
+            Output         = $Output
+        }
+    }
+
+    function Get-TargetNodes {
+        $nodes = @()
+
+        switch ($PSCmdlet.ParameterSetName) {
+            'Local' {
+                $nodes += [PSCustomObject]@{
+                    ComputerName = $env:COMPUTERNAME
+                    IsLocal      = $true
+                    CimSession   = $null
+                }
+            }
+
+            'ByName' {
+                foreach ($cn in $ComputerName) {
+                    $csParams = @{ ComputerName = $cn }
+                    if ($Credential) { $csParams.Credential = $Credential }
+
+                    $cs = New-CimSession @csParams
+                    $script:CreatedCimSessions += $cs
+
+                    $nodes += [PSCustomObject]@{
+                        ComputerName = $cn
+                        IsLocal      = $false
+                        CimSession   = $cs
+                    }
+                }
+            }
+
+            'ByCim' {
+                foreach ($cs in $CimSession) {
+                    $nodes += [PSCustomObject]@{
+                        ComputerName = $cs.ComputerName
+                        IsLocal      = $false
+                        CimSession   = $cs
+                    }
+                }
+            }
+        }
+
+        return $nodes
+    }
+
+    function Get-TargetVolumes {
+        param(
+            [Parameter(Mandatory)]
+            $Node
+        )
+
+        $vols = if ($Node.IsLocal) {
+            Get-Volume
+        } else {
+            Get-Volume -CimSession $Node.CimSession
+        }
+
+        $vols = $vols | Where-Object { $_.DriveType -eq 'Fixed' }
+
+        if (-not $IncludeHiddenVolumes) {
+            $vols = $vols | Where-Object { $_.DriveLetter }
+        }
+
+        if ($DriveLetters -and $DriveLetters.Count -gt 0) {
+            $wanted = $DriveLetters | ForEach-Object { $_.ToString().ToUpperInvariant() }
+            $vols = $vols | Where-Object {
+                $_.DriveLetter -and ($wanted -contains $_.DriveLetter.ToString().ToUpperInvariant())
+            }
+        }
+
+        if ($ExcludeDriveLetters -and $ExcludeDriveLetters.Count -gt 0) {
+            $excluded = $ExcludeDriveLetters | ForEach-Object { $_.ToString().ToUpperInvariant() }
+            $vols = $vols | Where-Object {
+                -not $_.DriveLetter -or ($excluded -notcontains $_.DriveLetter.ToString().ToUpperInvariant())
+            }
+        }
+
+        return @($vols)
+    }
+
+    function Get-OptimizeVolumeParameterSet {
+        param(
+            [Parameter(Mandatory)]
+            $Node,
+
+            [Parameter(Mandatory)]
+            $Volume,
+
+            [Parameter(Mandatory)]
+            [ValidateSet('Auto','Analyze','Defrag','ReTrim','SlabConsolidate')]
+            [string]$RequestedMode
+        )
+
+        $params = @{
+            ErrorAction = 'Stop'
+            Verbose     = $true
+        }
+
+        if ($NormalPriority) {
+            $params['NormalPriority'] = $true
+        }
+
+        if (-not $Node.IsLocal) {
+            $params['CimSession'] = $Node.CimSession
+        }
+
+        if ($Volume.DriveLetter) {
+            $params['DriveLetter'] = [char]$Volume.DriveLetter
+            $target = "$($Volume.DriveLetter):"
+        }
+        else {
+            $params['ObjectId'] = $Volume.ObjectId
+            $target = $Volume.ObjectId
+        }
+
+        switch ($RequestedMode) {
+            'Analyze'         { $params['Analyze'] = $true }
+            'Defrag'          { $params['Defrag'] = $true }
+            'ReTrim'          { $params['ReTrim'] = $true }
+            'SlabConsolidate' { $params['SlabConsolidate'] = $true }
+            'Auto'            { }
+        }
+
+        [PSCustomObject]@{
+            Target = $target
+            Params = $params
+        }
+    }
+
+    function Invoke-OptimizeVolumeSafe {
+        param(
+            [Parameter(Mandatory)]
+            $Node,
+
+            [Parameter(Mandatory)]
+            $Volume,
+
+            [Parameter(Mandatory)]
+            [ValidateSet('Auto','Analyze','Defrag','ReTrim','SlabConsolidate')]
+            [string]$RequestedMode
+        )
+
+        $label = [string]$Volume.FileSystemLabel
+        $paramSet = Get-OptimizeVolumeParameterSet -Node $Node -Volume $Volume -RequestedMode $RequestedMode
+        $target = $paramSet.Target
+        $params = $paramSet.Params
+
+        $cmdPreview = "Optimize-Volume " + (($params.GetEnumerator() | Sort-Object Name | ForEach-Object {
+            if ($_.Value -is [bool]) { "-$($_.Key)" }
+            elseif ($_.Key -eq 'CimSession') { "-CimSession <CimSession>" }
+            else { "-$($_.Key) `"$($_.Value)`"" }
+        }) -join ' ')
+
+        if ($WhatIfMode) {
+            return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                -ModeRequested $RequestedMode -ModeExecuted $RequestedMode `
+                -Status 'WhatIf' -Success $true -Message 'WhatIf mode - not executed.' `
+                -Command $cmdPreview
+        }
+
+        try {
+            $raw = Optimize-Volume @params 4>&1 | Out-String
+
+            return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                -ModeRequested $RequestedMode -ModeExecuted $RequestedMode `
+                -Status 'Success' -Success $true -Message 'Operation completed.' `
+                -Command $cmdPreview -Output $raw
+        }
+        catch {
+            $msg = $_.Exception.Message
+            $fqid = $_.FullyQualifiedErrorId
+
+            if ($msg -match 'not supported by the hardware backing the volume' -or $fqid -match '43022') {
+                return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                    -ModeRequested $RequestedMode -ModeExecuted $RequestedMode `
+                    -Status 'Unsupported' -Success $false -Message $msg `
+                    -Command $cmdPreview -ErrorId $fqid
+            }
+
+            return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                -ModeRequested $RequestedMode -ModeExecuted $RequestedMode `
+                -Status 'Failed' -Success $false -Message $msg `
+                -Command $cmdPreview -ErrorId $fqid
+        }
+    }
+
+    function Invoke-FreeSpaceConsolidation {
+        param(
+            [Parameter(Mandatory)]
+            $Node,
+
+            [Parameter(Mandatory)]
+            $Volume
+        )
+
+        $label = [string]$Volume.FileSystemLabel
+
+        if (-not $Volume.DriveLetter) {
+            return New-ResultObject -ComputerName $Node.ComputerName -Drive $Volume.ObjectId -Label $label `
+                -ModeRequested 'FreeSpaceConsolidate' -ModeExecuted 'FreeSpaceConsolidate' `
+                -Status 'Skipped' -Success $false `
+                -Message 'FreeSpaceConsolidate requires a drive letter.' `
+                -Command 'defrag.exe /X'
+        }
+
+        $target = "$($Volume.DriveLetter):"
+        $args = @($target, '/X', '/U', '/V')
+        if ($NormalPriority) { $args += '/H' }
+
+        $cmdPreview = "defrag.exe " + ($args -join ' ')
+
+        if ($WhatIfMode) {
+            return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                -ModeRequested 'FreeSpaceConsolidate' -ModeExecuted 'FreeSpaceConsolidate' `
+                -Status 'WhatIf' -Success $true -Message 'WhatIf mode - not executed.' `
+                -Command $cmdPreview
+        }
+
+        try {
+            if ($Node.IsLocal) {
+                $raw = & "$env:SystemRoot\System32\defrag.exe" @args 2>&1 | Out-String
+                $exitCode = $LASTEXITCODE
+            }
+            else {
+                $icmParams = @{
+                    ComputerName = $Node.ComputerName
+                    ScriptBlock  = {
+                        param(
+                            [string]$Drive,
+                            [bool]$UseNormalPriority
+                        )
+
+                        $defragArgs = @("$Drive", '/X', '/U', '/V')
+                        if ($UseNormalPriority) { $defragArgs += '/H' }
+
+                        $output = & "$env:SystemRoot\System32\defrag.exe" @defragArgs 2>&1 | Out-String
+                        [PSCustomObject]@{
+                            Output   = $output
+                            ExitCode = $LASTEXITCODE
+                            Command  = "defrag.exe " + ($defragArgs -join ' ')
+                        }
+                    }
+                    ArgumentList = @($target, [bool]$NormalPriority)
+                    ErrorAction  = 'Stop'
+                }
+
+                if ($Credential) { $icmParams.Credential = $Credential }
+
+                $remoteResult = Invoke-Command @icmParams
+                $raw = [string]$remoteResult.Output
+                $exitCode = [int]$remoteResult.ExitCode
+                $cmdPreview = [string]$remoteResult.Command
+            }
+
+            if ($exitCode -eq 0) {
+                return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                    -ModeRequested 'FreeSpaceConsolidate' -ModeExecuted 'FreeSpaceConsolidate' `
+                    -Status 'Success' -Success $true -Message 'Operation completed.' `
+                    -Command $cmdPreview -Output $raw -ExitCode $exitCode
+            }
+            else {
+                return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                    -ModeRequested 'FreeSpaceConsolidate' -ModeExecuted 'FreeSpaceConsolidate' `
+                    -Status 'Failed' -Success $false `
+                    -Message "defrag.exe returned exit code $exitCode." `
+                    -Command $cmdPreview -Output $raw -ExitCode $exitCode
+            }
+        }
+        catch {
+            return New-ResultObject -ComputerName $Node.ComputerName -Drive $target -Label $label `
+                -ModeRequested 'FreeSpaceConsolidate' -ModeExecuted 'FreeSpaceConsolidate' `
+                -Status 'Failed' -Success $false -Message $_.Exception.Message `
+                -Command $cmdPreview
+        }
+    }
+
+    function Process-Volume {
+        param(
+            [Parameter(Mandatory)]
+            $Node,
+
+            [Parameter(Mandatory)]
+            $Volume
+        )
+
+        $targetName = if ($Volume.DriveLetter) { "$($Volume.DriveLetter):" } else { $Volume.ObjectId }
+        Write-Log "Processing $($Node.ComputerName)\$targetName"
+
+        if ($Mode -eq 'FreeSpaceConsolidate') {
+            return Invoke-FreeSpaceConsolidation -Node $Node -Volume $Volume
+        }
+
+        $result = Invoke-OptimizeVolumeSafe -Node $Node -Volume $Volume -RequestedMode $Mode
+
+        if ($FallbackToAutoOnUnsupported -and $Mode -ne 'Auto' -and $result.Status -eq 'Unsupported') {
+            Write-Log "Mode $Mode unsupported on $($Node.ComputerName)\$targetName. Retrying with Auto." 'WARN'
+
+            $autoResult = Invoke-OptimizeVolumeSafe -Node $Node -Volume $Volume -RequestedMode 'Auto'
+
+            $autoResult = [PSCustomObject]@{
+                Timestamp      = $autoResult.Timestamp
+                ComputerName   = $autoResult.ComputerName
+                Drive          = $autoResult.Drive
+                Label          = $autoResult.Label
+                ModeRequested  = $Mode
+                ModeExecuted   = 'Auto'
+                Status         = $autoResult.Status
+                Success        = $autoResult.Success
+                Message        = "Fallback to Auto after unsupported $Mode. $($autoResult.Message)"
+                Command        = $autoResult.Command
+                ExitCode       = $autoResult.ExitCode
+                ErrorId        = $autoResult.ErrorId
+                Output         = $autoResult.Output
+            }
+
+            return $autoResult
+        }
+
+        return $result
+    }
+
+    Write-Log "Starting volume optimization. Mode=$Mode"
+    Write-Log "LogPath=$LogPath"
+    Write-Log "ParameterSet=$($PSCmdlet.ParameterSetName)"
+
+    if ($WhatIfMode) {
+        Write-Log "WhatIfMode enabled. No changes will be made." 'WARN'
+    }
+}
+
+process {
+    try {
+        $nodes = Get-TargetNodes
+
+        foreach ($node in $nodes) {
+            Write-Log "Enumerating volumes on $($node.ComputerName)"
+
+            $volumes = Get-TargetVolumes -Node $node
+
+            if (-not $volumes -or $volumes.Count -eq 0) {
+                Write-Log "No matching fixed volumes found on $($node.ComputerName)." 'WARN'
+                continue
+            }
+
+            $targetList = $volumes | ForEach-Object {
+                if ($_.DriveLetter) { "$($_.DriveLetter):" } else { $_.ObjectId }
+            }
+
+            Write-Log ("Target volumes on $($node.ComputerName): " + ($targetList -join ', '))
+
+            foreach ($vol in $volumes) {
+                $r = Process-Volume -Node $node -Volume $vol
+                $script:Results.Add($r)
+
+                $prefix = "$($r.ComputerName)\$($r.Drive)"
+                switch ($r.Status) {
+                    'Success' {
+                        Write-Log "Completed $prefix action=$($r.ModeExecuted)" 'SUCCESS'
+                    }
+                    'Unsupported' {
+                        Write-Log "Unsupported on $prefix action=$($r.ModeExecuted) : $($r.Message)" 'WARN'
+                    }
+                    'Skipped' {
+                        Write-Log "Skipped $prefix : $($r.Message)" 'WARN'
+                    }
+                    'WhatIf' {
+                        Write-Log "WhatIf $prefix action=$($r.ModeExecuted)" 'INFO'
+                    }
+                    default {
+                        Write-Log "Failed $prefix action=$($r.ModeExecuted) : $($r.Message)" 'ERROR'
+                    }
+                }
+
+                if ($r.Output) {
+                    Write-Log ("Output for $($prefix):`n" + $r.Output.Trim())
+                }
+            }
+        }
+
+        $successCount     = @($script:Results | Where-Object { $_.Status -eq 'Success' }).Count
+        $unsupportedCount = @($script:Results | Where-Object { $_.Status -eq 'Unsupported' }).Count
+        $failedCount      = @($script:Results | Where-Object { $_.Status -eq 'Failed' }).Count
+        $skippedCount     = @($script:Results | Where-Object { $_.Status -eq 'Skipped' }).Count
+        $whatIfCount      = @($script:Results | Where-Object { $_.Status -eq 'WhatIf' }).Count
+
+        Write-Log "Optimization complete. Success=$successCount Unsupported=$unsupportedCount Failed=$failedCount Skipped=$skippedCount WhatIf=$whatIfCount"
+
+        if ($PassThru) {
+            $script:Results
+        }
+    }
+    catch {
+        Write-Log ("Fatal error: " + $_.Exception.Message) 'ERROR'
+        throw
+    }
+}
+
+end {
+    foreach ($cs in $script:CreatedCimSessions) {
+        try {
+            if ($null -ne $cs) {
+                Remove-CimSession -CimSession $cs -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            # swallow cleanup errors
+        }
+    }
+
+    Write-Log "Finished."
+}
